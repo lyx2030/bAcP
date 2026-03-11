@@ -1,0 +1,432 @@
+rm(list=ls())
+library(foreach)
+library(doParallel)
+library(copula)
+library(quantmod)
+library(GenSA)
+library(timeDate)
+library(timeSeries)
+library(fBasics)
+library(fGarch) 
+options(warn=-1)
+set.seed(2024)
+
+# ----------------------------- Parameter Settings -----------------------------
+total_experiments <- 500          # Number of simulation experiments
+total_length <- 3000               # Length of simulated series
+scale_factor <- 100                 # Scaling factor for data (optional)
+q <- 0.90                           # Quantile threshold
+reptimes_optimization <- 100        # Repetitions for marginal optimization 
+reptimes_optimization_joint <- 20   # Repetitions for joint optimization 
+
+init_upper_marg <- c(10, 5)
+init_lower_marg <- c(1, 0.001)
+
+# Marginal parameters (a, b, phi0, phi1, phi2, phi3)
+marg_upper <- c(1000, 1000, 10, 1, 1, 100000)
+marg_lower <- c(0, 0, -10, 0.0000001, 0.000000001, 0.0001)
+nopara_marg <- length(marg_upper)
+
+# Joint parameters (beta0, beta1, beta2)
+joint_upper <- c(0.1, 0.9999, 0.5)
+joint_lower <- c(-0.1, 0.9, -0.1)
+nopara_joint <- length(joint_upper)
+
+nopara_total <- nopara_marg * 2 + nopara_joint
+total_lower <- c(marg_lower, marg_lower, joint_lower)
+total_upper <- c(marg_upper, marg_upper, joint_upper)
+
+# ----------------------------- Data Reading and Preprocessing -----------------------------
+raw_data <- read.csv("./Return.csv")
+date0 <- as.character(raw_data[,1])
+raw_data <- raw_data[,-1]
+total_T <- dim(raw_data)[1]
+total_stocks <- dim(raw_data)[2]
+USstocks <- c("DJI", "GSPC", "IXIC")
+nonUSstocks <- colnames(raw_data)[!colnames(raw_data) %in% USstocks]
+raw_data[-total_T, nonUSstocks] <- raw_data[-1, nonUSstocks]
+raw_data <- raw_data[-total_T, ]
+total_T <- dim(raw_data)[1]
+date0 <- as.Date(date0[-total_T], format='%Y/%m/%d')
+stocknames <- colnames(raw_data)
+observation <- -raw_data[,1]
+tau_global_obs <- as.numeric(quantile(observation, q))
+empirical_obs <- observation[observation < tau_global_obs]
+empirical <- list(empirical_obs, empirical_obs)
+
+true_margpara1 <- true_margpara2 <- c(36, 150, -0.35, 0.94, 0.18, 2678)
+true_jointpara <- c(0.01, 0.99, 0.1)
+tau1 <- tau2 <- r1 <- r2 <- tau_global_obs
+
+# ----------------------------- Marginal Model Functions -----------------------------
+getsigma <- function(para, R) {
+  n <- length(R)
+  a <- para[1]; b <- para[2]; phi0 <- para[3]; phi1 <- para[4]; phi2 <- para[5]; phi3 <- para[6]
+  logsigma <- rep(0, n)
+  logsigma[1] <- (phi0 + phi2 / 2) / (1 - phi1)
+  for (i in 1:(n-1))
+    logsigma[i+1] <- phi0 + phi1 * logsigma[i] + phi2 * exp(-phi3 * R[i])
+  return(exp(logsigma))
+}
+
+logik1 <- function(theta, R, ub, lb) {
+  a <- theta[1]; b <- theta[2]
+  n <- length(R)
+  penal <- 1e10
+  penalty <- penal * (sum(theta < lb) + sum(theta > ub))
+  sigma <- getsigma(theta, R)
+  logik <- sum(log(I(R == 0) * (1 - 1/(1 + a * r1)^(b * sigma)) +
+                     I(R > 0) * (1/(1 + a * r1)^(b * sigma) * b * (1 + R/sigma)^(-b * sigma - 1)))) / n
+  return(-logik + penalty)
+}
+
+logik2 <- function(theta, R, ub, lb) {
+  a <- theta[1]; b <- theta[2]
+  n <- length(R)
+  penal <- 1e10
+  penalty <- penal * (sum(theta < lb) + sum(theta > ub))
+  sigma <- getsigma(theta, R)
+  logik <- sum(log(I(R == 0) * (1 - 1/(1 + a * r2)^(b * sigma)) +
+                     I(R > 0) * (1/(1 + a * r2)^(b * sigma) * b * (1 + R/sigma)^(-b * sigma - 1)))) / n
+  return(-logik + penalty)
+}
+
+lb <- c(0, 0, -10, 0.0000001, 0.000000001, 0.0001)
+ub <- c(1000, 1000, 10, 1, 1, 100000)
+
+# ----------------------------- GPD Functions -----------------------------
+dGPD <- function(y, tau, a, sigma, xi) {
+  indicator <- y > 0
+  result <- (indicator == 0) * (1 - (1/(1 + a * tau))^xi) +
+            (indicator > 0) * ((1/(1 + a * tau))^xi) * (xi/sigma) * (1 + y/sigma)^(-xi - 1)
+  return(result)
+}
+qGPD <- function(q, tau, a, sigma, xi) {
+  indicator <- q < 1 - (tau/sigma)^(-xi)
+  (indicator > 0) * 0 + (indicator == 0) * (sigma * ((1 - q)^(-1/xi) / (1 + a * tau) - 1))
+}
+pGPD <- function(y, tau, a, sigma, xi) {
+  indicator <- y > 0
+  result <- (indicator == 0) * (1 - (1/(1 + a * tau))^xi) +
+            (indicator > 0) * (1 - ((1/(1 + a * tau))^xi) * ((1 + y/sigma)^(-xi)))
+  return(result)
+}
+
+# ----------------------------- GAS Transformation Helpers -----------------------------
+logistic <- function(alpha) return(log(alpha - 1))
+sigmoid <- function(lambda) return(1 + exp(lambda))
+
+# ----------------------------- Gumbel Copula Functions -----------------------------
+logisticTailDep <- function(z1, z2, alpha) {
+  return(exp(-(z1^alpha + z2^alpha)^(1/alpha)))
+}
+logisticTailDepPartialDiff1 <- function(z1, z2, alpha) {
+  return(-logisticTailDep(z1, z2, alpha) * (z1^alpha + z2^alpha)^(1/alpha - 1) * z1^(alpha - 1))
+}
+logisticTailDepPartialDiff2 <- function(z1, z2, alpha) {
+  return(-logisticTailDep(z1, z2, alpha) * (z1^alpha + z2^alpha)^(1/alpha - 1) * z2^(alpha - 1))
+}
+logisticTailDepPartialDiff12 <- function(z1, z2, alpha) {
+  part1 <- logisticTailDep(z1, z2, alpha) * (z1^alpha + z2^alpha)^(2/alpha - 2) * z2^(alpha - 1) * z1^(alpha - 1)
+  part2 <- logisticTailDep(z1, z2, alpha) * (z1^alpha + z2^alpha)^(1/alpha - 2) * z2^(alpha - 1) * z1^(alpha - 1) * (alpha - 1)
+  return(part1 + part2)
+}
+lPartialAlpha <- function(z1, z2, alpha) {
+  return((z1^alpha + z2^alpha)^(1/alpha) * (-1/alpha^2 * log(z1^alpha + z2^alpha) +
+           1/alpha * (z1^alpha * log(z1) + z2^alpha * log(z2)) / (z1^alpha + z2^alpha)))
+}
+logisticTailDepPartialAlpha <- function(z1, z2, alpha) return(-lPartialAlpha(z1, z2, alpha))
+logisticTailDepPartialAlpha1 <- function(z1, z2, alpha) {
+  return(-lPartialAlpha(z1, z2, alpha) - 1/alpha^2 * log(z1^alpha + z2^alpha) +
+           (1/alpha - 1) * (z1^alpha * log(z1) + z2^alpha * log(z2)) / (z1^alpha + z2^alpha) + log(z1))
+}
+logisticTailDepPartialAlpha2 <- function(z1, z2, alpha) {
+  return(-lPartialAlpha(z1, z2, alpha) - 1/alpha^2 * log(z1^alpha + z2^alpha) +
+           (1/alpha - 1) * (z1^alpha * log(z1) + z2^alpha * log(z2)) / (z1^alpha + z2^alpha) + log(z2))
+}
+logisticTailDepPartialAlpha12 <- function(z1, z2, alpha) {
+  part1 <- -lPartialAlpha(z1, z2, alpha) + (log(z1) + log(z2)) - 1/alpha^2 * log(z1^alpha + z2^alpha)
+  part2 <- (1/alpha - 2) * (z1^alpha * log(z1) + z2^alpha * log(z2)) / (z1^alpha + z2^alpha)
+  part3 <- (lPartialAlpha(z1, z2, alpha) + 1) / ((z1^alpha + z2^alpha)^(1/alpha) + alpha - 1)
+  return(part1 + part2 + part3)
+}
+
+# ----------------------------- Recover Alpha Series -----------------------------
+recoverAlpha <- function(jointpara, yTrans, yRaw = NULL, init = NULL) {
+  lower_bound <- 1 + 1e-5; upper_bound <- 20
+  totalT <- dim(yTrans)[2]
+  alpha <- rep(0, totalT)
+  beta0 <- jointpara[1]; beta1 <- jointpara[2]; beta2 <- jointpara[3]
+  if (is.null(init)) alpha[1] <- 2 else alpha[1] <- init
+  for (t in 2:totalT) {
+    z1 <- yTrans[1, t-1]; z2 <- yTrans[2, t-1]
+    ind1 <- yRaw[1, t-1] > 0; ind2 <- yRaw[2, t-1] > 0
+    if (!ind1 & !ind2) innovation <- logisticTailDepPartialAlpha(z1, z2, alpha[t-1]) * (alpha[t-1] - 1)
+    if (ind1 & !ind2) innovation <- logisticTailDepPartialAlpha1(z1, z2, alpha[t-1]) * (alpha[t-1] - 1)
+    if (!ind1 & ind2) innovation <- logisticTailDepPartialAlpha2(z1, z2, alpha[t-1]) * (alpha[t-1] - 1)
+    if (ind1 & ind2) innovation <- logisticTailDepPartialAlpha12(z1, z2, alpha[t-1]) * (alpha[t-1] - 1)
+    alpha[t] <- sigmoid(beta0 + beta1 * logistic(alpha[t-1]) + beta2 * innovation)
+    if (alpha[t] < lower_bound | is.na(alpha[t])) alpha[t] <- lower_bound
+    if (alpha[t] > upper_bound | is.na(alpha[t])) alpha[t] <- upper_bound
+  }
+  return(alpha)
+}
+
+# ----------------------------- Joint Density and Log-likelihood -----------------------------
+dMPoT <- function(y1, y2, Fy1, Fy2, alpha) {
+  ind1 <- (y1 == 0) & (y2 == 0)
+  ind2 <- (y1 > 0) & (y2 == 0)
+  ind3 <- (y1 == 0) & (y2 > 0)
+  ind4 <- (y1 > 0) & (y2 > 0)
+  z1 <- -log(Fy1); z2 <- -log(Fy2)
+  part1 <- logisticTailDep(z1 = z1[ind1], z2 = z2[ind1], alpha = alpha[ind1])
+  part2 <- -logisticTailDepPartialDiff1(z1 = z1[ind2], z2 = z2[ind2], alpha = alpha[ind2])
+  part3 <- -logisticTailDepPartialDiff2(z1 = z1[ind3], z2 = z2[ind3], alpha = alpha[ind3])
+  part4 <- logisticTailDepPartialDiff12(z1 = z1[ind4], z2 = z2[ind4], alpha = alpha[ind4])
+  return(c(part1, part2, part3, part4))
+}
+
+loglikBivariate <- function(jointpara, y, Fy, yTrans, init = NULL) {
+  alpha <- recoverAlpha(jointpara = jointpara, yTrans = yTrans, yRaw = y, init)
+  loglik <- -sum(log(dMPoT(y1 = y[1, -c(1:100)], y2 = y[2, -c(1:100)],
+                           Fy1 = Fy[1, -c(1:100)], Fy2 = Fy[2, -c(1:100)],
+                           alpha = alpha[-c(1:100)])))
+  return(loglik)
+}
+
+# ----------------------------- Initial Joint Estimation (Static) -----------------------------
+initialEst_Joint <- function(para, a1, a2, y, tau) {
+  tau1 <- tau[1]; xi1 <- para[1]; sigma1 <- para[2]
+  tau2 <- tau[2]; xi2 <- para[3]; sigma2 <- para[4]
+  alpha <- para[5]
+  y1 <- y[1, ]; y2 <- y[2, ]
+  Fy1 <- pGPD(y1, tau1, a1, sigma1, xi1)
+  Fy2 <- pGPD(y2, tau2, a2, sigma2, xi2)
+  fy1 <- dGPD(y1, tau1, a1, sigma1, xi1)
+  fy2 <- dGPD(y2, tau2, a2, sigma2, xi2)
+  loglik <- -sum(log(dMPoTInit(y1 = y1, y2 = y2, Fy1 = Fy1, Fy2 = Fy2,
+                                fy1 = fy1, fy2 = fy2, alpha = alpha)))
+  return(loglik)
+}
+
+dMPoTInit <- function(y1, y2, Fy1, Fy2, fy1, fy2, alpha) {
+  ind1 <- (y1 == 0) & (y2 == 0)
+  ind2 <- (y1 > 0) & (y2 == 0)
+  ind3 <- (y1 == 0) & (y2 > 0)
+  ind4 <- (y1 > 0) & (y2 > 0)
+  z1 <- -log(Fy1); z2 <- -log(Fy2)
+  part1 <- logisticTailDep(z1 = z1[ind1], z2 = z2[ind1], alpha = alpha)
+  part2 <- -logisticTailDepPartialDiff1(z1 = z1[ind2], z2 = z2[ind2], alpha = alpha) * (fy1[ind2] / Fy1[ind2])
+  part3 <- -logisticTailDepPartialDiff2(z1 = z1[ind3], z2 = z2[ind3], alpha = alpha) * (fy2[ind3] / Fy2[ind3])
+  part4 <- logisticTailDepPartialDiff12(z1 = z1[ind4], z2 = z2[ind4], alpha = alpha) * (fy1[ind4] / Fy1[ind4]) * (fy2[ind4] / Fy2[ind4])
+  return(c(part1, part2, part3, part4))
+}
+
+# ----------------------------- Data Generation Function -----------------------------
+simuBivariate_garch_gumbel <- function(margpara1, margpara2, jointpara, total, empirical) {
+  a_1 <- margpara1[1]; b_1 <- margpara1[2]; phi0_1 <- margpara1[3]; phi1_1 <- margpara1[4]; phi2_1 <- margpara1[5]; phi3_1 <- margpara1[6]
+  a_2 <- margpara2[1]; b_2 <- margpara2[2]; phi0_2 <- margpara2[3]; phi1_2 <- margpara2[4]; phi2_2 <- margpara2[5]; phi3_2 <- margpara2[6]
+  empirical_1 <- empirical[[1]]; empirical_2 <- empirical[[2]]
+  beta0 <- jointpara[1]; beta1 <- jointpara[2]; beta2 <- jointpara[3]
+  N <- total
+  lower_bound <- 1 + 1e-5; upper_bound <- 10
+  raw_obs <- y_obs <- xi_obs <- sigma_obs <- matrix(rep(0, 2*N), nrow = 2)
+  alpha_obs <- rep(0, N)
+  sigma_obs[,1] <- exp((phi0_1 + phi2_1/2) / (1 - phi1_1)); xi_obs[,1] <- b_1 * sigma_obs[,1]
+  sigma_obs[,2] <- exp((phi0_2 + phi2_2/2) / (1 - phi1_2)); xi_obs[,2] <- b_2 * sigma_obs[,2]
+  alpha_obs[1] <- 2
+  randomU <- rCopula(1, gumbelCopula(param = alpha_obs[1], dim = 2))
+  if (randomU[1] < 1 - (1/(1 + a_1 * tau1))^xi_obs[1,1]) {
+    y_obs[1,1] <- 0
+  } else {
+    y_obs[1,1] <- qGPD(randomU[1], tau1, a_1, sigma_obs[1,1], xi_obs[1,1])
+  }
+  if (randomU[2] < 1 - (1/(1 + a_2 * tau2))^xi_obs[2,1]) {
+    y_obs[2,1] <- 0
+  } else {
+    y_obs[2,1] <- qGPD(randomU[2], tau2, a_2, sigma_obs[2,1], xi_obs[2,1])
+  }
+  for (t in 2:N) {
+    sigma_obs[1,t] <- exp(phi0_1 + phi1_1 * log(sigma_obs[1,t-1]) + phi2_1 * exp(-phi3_1 * y_obs[1,t-1]))
+    xi_obs[1,t] <- b_1 * sigma_obs[1,t]
+    sigma_obs[2,t] <- exp(phi0_2 + phi1_2 * log(sigma_obs[2,t-1]) + phi2_2 * exp(-phi3_2 * y_obs[2,t-1]))
+    xi_obs[2,t] <- b_2 * sigma_obs[2,t]
+    z1 <- -log(pGPD(y_obs[1,t-1], tau1, a_1, sigma_obs[1,t-1], xi_obs[1,t-1]))
+    z2 <- -log(pGPD(y_obs[2,t-1], tau2, a_2, sigma_obs[2,t-1], xi_obs[2,t-1]))
+    ind1 <- y_obs[1,t-1] > 0; ind2 <- y_obs[2,t-1] > 0
+    if (!ind1 & !ind2) innovation <- logisticTailDepPartialAlpha(z1, z2, alpha_obs[t-1]) * (alpha_obs[t-1] - 1)
+    if (ind1 & !ind2) innovation <- logisticTailDepPartialAlpha1(z1, z2, alpha_obs[t-1]) * (alpha_obs[t-1] - 1)
+    if (!ind1 & ind2) innovation <- logisticTailDepPartialAlpha2(z1, z2, alpha_obs[t-1]) * (alpha_obs[t-1] - 1)
+    if (ind1 & ind2) innovation <- logisticTailDepPartialAlpha12(z1, z2, alpha_obs[t-1]) * (alpha_obs[t-1] - 1)
+    alpha_obs[t] <- sigmoid(beta0 + beta1 * logistic(alpha_obs[t-1]) + beta2 * innovation)
+    if (alpha_obs[t] < lower_bound | is.na(alpha_obs[t])) alpha_obs[t] <- lower_bound
+    if (alpha_obs[t] > upper_bound | is.na(alpha_obs[t])) alpha_obs[t] <- upper_bound
+    randomU <- rCopula(1, gumbelCopula(param = alpha_obs[t], dim = 2))
+    if (randomU[1] < 1 - (1/(1 + a_1 * tau1))^xi_obs[1,t]) {
+      y_obs[1,t] <- 0
+    } else {
+      y_obs[1,t] <- qGPD(randomU[1], tau1, a_1, sigma_obs[1,t], xi_obs[1,t])
+    }
+    if (randomU[2] < 1 - (1/(1 + a_2 * tau2))^xi_obs[2,t]) {
+      y_obs[2,t] <- 0
+    } else {
+      y_obs[2,t] <- qGPD(randomU[2], tau2, a_2, sigma_obs[2,t], xi_obs[2,t])
+    }
+  }
+  return(list(y = y_obs, xi = xi_obs, sigma = sigma_obs, alpha = alpha_obs))
+}
+
+# ----------------------------- Main Simulation Loop -----------------------------
+sigma1 <- sigma2 <- xi1 <- xi2 <- matrix(0, nrow = total_experiments, ncol = total_length)
+sim_para1 <- sim_para2 <- matrix(0, ncol = 7, nrow = total_experiments)
+alpha_joint <- matrix(0, nrow = total_experiments, ncol = total_length)
+est_joint_all <- matrix(0, ncol = 3, nrow = total_experiments)
+cor_xi1_p <- cor_sigma1_p <- cor_xi2_p <- cor_sigma2_p <- cor_alpha_p <-
+cor_xi1_s <- cor_sigma1_s <- cor_xi2_s <- cor_sigma2_s <- cor_alpha_s <- numeric(total_experiments)
+
+for (i in 1:total_experiments) {
+  set.seed(1000 * i)
+  simu_data <- simuBivariate_garch_gumbel(true_margpara1, true_margpara2,
+                                          jointpara = true_jointpara,
+                                          total = total_length, empirical = empirical)
+  observation <- simu_data$y
+  tau_global_1 <- tau1; tau_global_2 <- tau2; tau_global <- c(tau1, tau2)
+  R1 <- observation[1, ]; L1 <- R1[R1 > 0]
+  R2 <- observation[2, ]; L2 <- R2[R2 > 0]
+
+  # First series estimation
+  finale1 <- matrix(0, ncol = 7, nrow = reptimes_optimization)
+  for (jj in 1:reptimes_optimization) {
+    set.seed(307 * jj)
+    loc <- runif(1)
+    start <- loc * lb + (1 - loc) * ub
+    fitTMP <- nlminb(start, logik1, lower = lb, upper = ub,
+                     control = list(eval.max = 1e7, iter.max = 1e7), R = R1, ub = ub, lb = lb)
+    result1 <- fitTMP$par
+    finale1[jj, ] <- c(result1, logik1(result1, R1, ub, lb))
+  }
+  para1 <- finale1[finale1[,7] == min(finale1[,7]), ]
+  sim_para1[i, ] <- c(para1)
+  sigma1[i, ] <- getsigma(sim_para1[i, 1:6], R1)
+  xi1[i, ] <- sigma1[i, ] * sim_para1[i, 2]
+
+  # Second series estimation
+  finale2 <- matrix(0, ncol = 7, nrow = reptimes_optimization)
+  for (jj in 1:reptimes_optimization) {
+    set.seed(307 * jj)
+    loc <- runif(1)
+    start <- loc * lb + (1 - loc) * ub
+    fitTMP <- nlminb(start, logik2, lower = lb, upper = ub,
+                     control = list(eval.max = 1e7, iter.max = 1e7), R = R2, ub = ub, lb = lb)
+    result2 <- fitTMP$par
+    finale2[jj, ] <- c(result2, logik2(result2, R2, ub, lb))
+  }
+  para2 <- finale2[finale2[,7] == min(finale2[,7]), ]
+  sim_para2[i, ] <- c(para2)
+  sigma2[i, ] <- getsigma(sim_para2[i, 1:6], R2)
+  xi2[i, ] <- sigma2[i, ] * sim_para2[i, 2]
+
+  # Joint estimation
+  est_marg1 <- sim_para1[i, 1:6]
+  est_marg2 <- sim_para2[i, 1:6]
+  xiSigma_marg1 <- rbind(xi1[i, ], sigma1[i, ])
+  xiSigma_marg2 <- rbind(xi2[i, ], sigma2[i, ])
+  observation <- rbind(R1, R2)
+  init_upper_joint <- c(10, 0.5, 10, 0.5, 10)
+  init_lower_joint <- c(0.1, 0.001, 0.1, 0.001, 1.001)
+
+  temp_result0_joint <- c()
+  for (rep in 1:10) {
+    start <- init_lower_joint + (init_upper_joint - init_lower_joint) * runif(length(init_lower_joint))
+    temp <- nlminb(start, initialEst_Joint, upper = init_upper_joint, lower = init_lower_joint,
+                   tau = tau_global, y = observation, a1 = 30, a2 = 30)
+    temp_result0_joint <- rbind(temp_result0_joint, c(temp$par, temp$objective))
+  }
+  init_joint <- temp_result0_joint[which.min(temp_result0_joint[, length(init_lower_joint) + 1]), 1:length(init_upper_joint)]
+
+  a1 <- sim_para1[i,1]; a2 <- sim_para2[i,1]
+  Fy1 <- pGPD(R1, r1, a1, sigma1[i, ], xi1[i, ])
+  Fy2 <- pGPD(R2, r2, a2, sigma2[i, ], xi2[i, ])
+  Fy_est <- rbind(Fy1, Fy2)
+  yTrans1 <- -log(Fy1); yTrans2 <- -log(Fy2)
+  yTrans_est <- rbind(yTrans1, yTrans2)
+
+  temp_result_joint <- c()
+  for (rep in 1:reptimes_optimization_joint) {
+    start <- joint_lower + (joint_upper - joint_lower) * runif(nopara_joint)
+    temp <- tryCatch({
+      nlminb(start, loglikBivariate, upper = joint_upper, lower = joint_lower,
+             y = observation, Fy = Fy_est, yTrans = yTrans_est, init = init_joint[5])
+    }, error = function(e) NULL)
+    if (!is.null(temp) && temp$message == 'relative convergence (4)') {
+      temp_result_joint <- rbind(temp_result_joint, c(temp$par, temp$objective))
+    }
+  }
+  for (rep in 1:reptimes_optimization_joint) {
+    start <- joint_lower + (joint_upper - joint_lower) * runif(nopara_joint)
+    temp <- nlminb(start, loglikBivariate, upper = joint_upper, lower = joint_lower,
+                   y = observation, Fy = Fy_est, yTrans = yTrans_est, init = init_joint[5])
+    temp_result_joint <- rbind(temp_result_joint, c(temp$par, temp$objective))
+  }
+  est_joint <- temp_result_joint[which.min(temp_result_joint[, nopara_joint + 1]), ]
+  est_joint_all[i, ] <- est_joint[1:nopara_joint]
+  alpha_joint[i, ] <- recoverAlpha(jointpara = est_joint, yTrans = yTrans_est,
+                                   yRaw = observation, init = init_joint[5])
+
+  # Correlation calculations
+  cor_xi1_p[i] <- cor(simu_data$xi[1, ], xi1[i, ], method = "pearson")
+  cor_sigma1_p[i] <- cor(simu_data$sigma[1, ], sigma1[i, ], method = "pearson")
+  cor_xi2_p[i] <- cor(simu_data$xi[2, ], xi2[i, ], method = "pearson")
+  cor_sigma2_p[i] <- cor(simu_data$sigma[2, ], sigma2[i, ], method = "pearson")
+  cor_alpha_p[i] <- cor(simu_data$alpha, alpha_joint[i, ], method = "pearson")
+  cor_xi1_s[i] <- cor(simu_data$xi[1, ], xi1[i, ], method = "spearman")
+  cor_sigma1_s[i] <- cor(simu_data$sigma[1, ], sigma1[i, ], method = "spearman")
+  cor_xi2_s[i] <- cor(simu_data$xi[2, ], xi2[i, ], method = "spearman")
+  cor_sigma2_s[i] <- cor(simu_data$sigma[2, ], sigma2[i, ], method = "spearman")
+  cor_alpha_s[i] <- cor(simu_data$alpha, alpha_joint[i, ], method = "spearman")
+}
+
+# ----------------------------- Summary Statistics -----------------------------
+cor_xi1_pm <- mean(cor_xi1_p); cor_xi1_ps <- sd(cor_xi1_p)
+cor_sigma1_pm <- mean(cor_sigma1_p); cor_sigma1_ps <- sd(cor_sigma1_p)
+cor_xi2_pm <- mean(cor_xi2_p); cor_xi2_ps <- sd(cor_xi2_p)
+cor_sigma2_pm <- mean(cor_sigma2_p); cor_sigma2_ps <- sd(cor_sigma2_p)
+cor_alpha_pm <- mean(cor_alpha_p); cor_alpha_ps <- sd(cor_alpha_p)
+
+cor_xi1_sm <- mean(cor_xi1_s); cor_xi1_ss <- sd(cor_xi1_s)
+cor_sigma1_sm <- mean(cor_sigma1_s); cor_sigma1_ss <- sd(cor_sigma1_s)
+cor_xi2_sm <- mean(cor_xi2_s); cor_xi2_ss <- sd(cor_xi2_s)
+cor_sigma2_sm <- mean(cor_sigma2_s); cor_sigma2_ss <- sd(cor_sigma2_s)
+cor_alpha_sm <- mean(cor_alpha_s); cor_alpha_ss <- sd(cor_alpha_s)
+
+correlation_pm <- c(cor_xi1_pm, cor_sigma1_pm, cor_xi2_pm, cor_sigma2_pm, cor_alpha_pm)
+correlation_ps <- c(cor_xi1_ps, cor_sigma1_ps, cor_xi2_ps, cor_sigma2_ps, cor_alpha_ps)
+correlation_sm <- c(cor_xi1_sm, cor_sigma1_sm, cor_xi2_sm, cor_sigma2_sm, cor_alpha_sm)
+correlation_ss <- c(cor_xi1_ss, cor_sigma1_ss, cor_xi2_ss, cor_sigma2_ss, cor_alpha_ss)
+result_cor <- cbind(correlation_pm, correlation_ps, correlation_sm, correlation_ss)
+
+# ----------------------------- Parameter Results -----------------------------
+sim_para1_mean <- apply(sim_para1, 2, mean)[1:6]
+sim_para1_sd <- apply(sim_para1, 2, sd)[1:6]
+sim_para2_mean <- apply(sim_para2, 2, mean)[1:6]
+sim_para2_sd <- apply(sim_para2, 2, sd)[1:6]
+joint_mean <- apply(est_joint_all, 2, mean)
+joint_sd <- apply(est_joint_all, 2, sd)
+
+sim_para1_result <- rbind(sim_para1_mean, sim_para1_sd)
+sim_para2_result <- rbind(sim_para2_mean, sim_para2_sd)
+joint_result <- rbind(joint_mean, joint_sd)
+result_para <- cbind(sim_para1_result, sim_para2_result, joint_result)
+
+# ----------------------------- Output -----------------------------
+write.csv(result_para, "result_para_3000.csv")
+write.csv(result_cor, "result_cor_3000.csv")
+write.csv(sim_para1, "sim_para1_3000.csv")
+write.csv(sim_para2, "sim_para2_3000.csv")
+write.csv(alpha_joint, "alpha_joint_3000.csv")
+write.csv(est_joint_all, "est_joint_all_3000.csv")
+write.csv(xi1, "xi1_3000.csv")
+write.csv(xi2, "xi2_3000.csv")
+write.csv(sigma1, "sigma1_3000.csv")
+write.csv(sigma2, "sigma2_3000.csv")
+write.csv(simu_data, "simu_data_3000.csv")

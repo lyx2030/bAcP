@@ -1,0 +1,2 @@
+
+The global stock markets data used for analysis are available from the supplementary materials of Zhao (2021) at https://doi.org/10.1080/07350015.2020.1737083.
